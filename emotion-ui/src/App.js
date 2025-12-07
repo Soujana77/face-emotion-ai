@@ -1,166 +1,141 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState } from "react";
+import Summary from "./Summary";
 
 const API = "http://127.0.0.1:5000";
 
 export default function App() {
-  const [emotion, setEmotion] = useState("idle");
+  const [emotion, setEmotion] = useState("Detecting...");
   const [confidence, setConfidence] = useState(0);
-  const [capturing, setCapturing] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
+  const [viewMode, setViewMode] = useState("live"); // live | summary
+  const [loading, setLoading] = useState(false);
 
-  const pollRef = useRef(null);
+  // Realtime emotion polling
+  useEffect(() => {
+    let stop = false;
+    async function poll() {
+      while (!stop) {
+        if (!sessionId) break;
 
-  // ------------ Emotion Polling Handler ------------
-  const startCapture = () => {
-    if (capturing) return;
-    setCapturing(true);
+        try {
+          const res = await fetch(`${API}/emotion`);
+          const data = await res.json();
 
-    pollRef.current = setInterval(async () => {
-      try {
-        const res = await fetch(`${API}/emotion`);
-        const data = await res.json();
+          const label = data?.emotion ?? "unknown";
+          const conf =
+            typeof data?.confidence === "number" ? data.confidence * 100 : 0;
 
-        setEmotion(data?.emotion ?? "unknown");
-        setConfidence(Math.max(0, Math.min(100, (data?.confidence ?? 0) * 100)));
-      } catch {
-        setEmotion("backend_offline");
-        setConfidence(0);
+          setEmotion(label);
+          setConfidence(conf.toFixed(1));
+        } catch {
+          setEmotion("backend_offline");
+          setConfidence(0);
+        }
+
+        await new Promise((r) => setTimeout(r, 800));
       }
-    }, 1200);
-  };
+    }
 
-  const stopCapture = () => {
-    setCapturing(false);
-    clearInterval(pollRef.current);
-    pollRef.current = null;
-    setEmotion("stopped");
-    setConfidence(0);
-  };
+    if (sessionId) poll();
+    return () => (stop = true);
+  }, [sessionId]);
 
-  useEffect(() => () => clearInterval(pollRef.current), []);
+  // 🔘 START SESSION
+  async function startSession() {
+    setLoading(true);
+    try {
+      const res = await fetch(`${API}/sessions/start`, { method: "POST" });
+      const data = await res.json();
+      setSessionId(data.id);
+      setViewMode("live");
+    } catch {
+      alert("Backend offline / API failed");
+    }
+    setLoading(false);
+  }
 
-  return (
+  // 🛑 STOP SESSION
+  async function stopSession() {
+    if (!sessionId) return alert("Session not active!");
+    await fetch(`${API}/sessions/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: sessionId }),
+    });
+    alert("Session Stopped ✔");
+  }
+
+  return viewMode === "summary" ? (
+    <Summary sessionId={sessionId} goHome={() => setViewMode("live")} />
+  ) : (
     <div style={styles.page}>
-      <h1 style={styles.title}>Emotion Monitoring Dashboard</h1>
+      <h1 style={styles.heading}>Emotion Detection – Live</h1>
 
-      {/* Emotion Box */}
+      {/* Camera Stream */}
+      <div style={styles.videoBox}>
+        <img
+          src={`${API}/video_feed`}
+          alt="Live Camera"
+          style={{ width: "100%", height: "100%", objectFit: "cover" }}
+        />
+      </div>
+
+      {/* Live Stats */}
       <div style={styles.card}>
-        <div style={{ fontSize: "1.9rem" }}>Current Emotion:</div>
-        <div style={styles.emotionTxt}>{emotion}</div>
-
-        {/* Confidence Bar */}
-        <div style={styles.barBox}>
-          <div style={{ ...styles.barFill, width: `${confidence}%` }} />
-        </div>
-        <p style={{ marginTop: 5, opacity: 0.7 }}>
-          Confidence: <b>{confidence.toFixed(1)}%</b>
-        </p>
+        <h2>Emotion: <b style={{color:"#4dd0ff"}}>{emotion}</b></h2>
+        <p style={{ opacity: 0.8 }}>Confidence: {confidence}%</p>
       </div>
 
-      {/* Live Camera Feed */}
-      <div style={styles.camBox}>
-        <img src={`${API}/video_feed`} alt="Live feed" style={styles.cam} />
+      {/* Buttons */}
+      <div style={styles.btnRow}>
+        <button style={styles.start} onClick={startSession} disabled={loading}>
+          ▶ Start Session
+        </button>
+
+        <button style={styles.stop} onClick={stopSession}>
+          ⏹ Stop Session
+        </button>
+
+        <button style={styles.summary} onClick={() => setViewMode("summary")}>
+          📊 View Summary
+        </button>
       </div>
 
-      {/* Control Buttons */}
-      <div style={{ display: "flex", gap: 20 }}>
-        <button style={styles.btnStart} onClick={startCapture}>Start</button>
-        <button style={styles.btnStop} onClick={stopCapture}>Stop</button>
-      </div>
-
-      {/* Future Section: Graph UI */}
-      <div style={styles.graphCard}>
-        📊 <b>Real-Time Graph</b> will appear here soon!
-        <p style={{ opacity: 0.6, marginTop: 4 }}>This is Step C — next upgrade.</p>
-      </div>
-
-      <p style={{ marginTop: 15, opacity: 0.4 }}>* Make sure server.py is running *</p>
+      <p style={{ opacity: 0.5 }}>Session ID: {sessionId || "None"}</p>
     </div>
   );
 }
 
-// ---------- STYLES ----------
+// ======= CSS in JS =======
 const styles = {
   page: {
-    background: "#0D1321",
+    background: "#0d1117",
+    color: "#fff",
     minHeight: "100vh",
-    color: "white",
-    padding: 40,
-    display: "flex",
-    flexDirection: "column",
-    alignItems: "center",
-    gap: 30,
-  },
-  title: { fontSize: "3rem", fontWeight: 800 },
-
-  card: {
-    background: "#151b2c",
-    padding: "26px 40px",
-    borderRadius: 16,
-    border: "2px solid #ffffff22",
     textAlign: "center",
-    minWidth: 350,
+    paddingTop: 30,
   },
-  emotionTxt: {
-    fontSize: "2.2rem",
-    color: "#4fd1ff",
-    textTransform: "capitalize",
-    fontWeight: "bold",
-    marginTop: 8,
-  },
-
-  // Confidence Bar
-  barBox: {
-    width: "100%",
-    height: 10,
-    background: "#333",
-    borderRadius: 10,
-    marginTop: 15,
-    overflow: "hidden",
-  },
-  barFill: {
-    height: "100%",
-    background: "#4fd1ff",
-    transition: "0.4s",
-  },
-
-  camBox: {
-    marginTop: 10,
-    border: "4px solid #ffffff33",
-    borderRadius: 14,
-    overflow: "hidden",
+  heading: { fontSize: "2.8rem", fontWeight: 800, marginBottom: 25 },
+  videoBox: {
     width: 640,
     height: 480,
-    background: "#000000",
-  },
-  cam: { width: "100%", height: "100%", objectFit: "cover" },
-
-  // Buttons
-  btnStart: {
-    background: "#00e676",
-    padding: "12px 26px",
-    borderRadius: 10,
-    border: "none",
-    fontSize: 18,
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-  btnStop: {
-    background: "#ff5252",
-    padding: "12px 26px",
-    borderRadius: 10,
-    border: "none",
-    fontSize: 18,
-    fontWeight: 700,
-    cursor: "pointer",
-  },
-
-  graphCard: {
-    background: "#1b1f30",
-    marginTop: 15,
-    padding: 25,
     borderRadius: 14,
-    border: "1px dashed #ffffff33",
-    width: 640,
-    textAlign: "center",
+    border: "3px solid #ffffff3a",
+    margin: "auto",
+    overflow: "hidden",
+    marginBottom: 20,
   },
+  card: {
+    background: "#151b2c",
+    padding: "14px",
+    width: 300,
+    margin: "auto",
+    borderRadius: 12,
+    marginBottom: 20,
+    border: "1px solid #4dd0ff22",
+  },
+  btnRow: { display: "flex", gap: 10, justifyContent: "center" },
+  start: { background: "#00c853", padding: "10px 20px", borderRadius: 8 },
+  stop: { background: "#ff1744", padding: "10px 20px", borderRadius: 8 },
+  summary: { background: "#2979ff", padding: "10px 20px", borderRadius: 8 },
 };
