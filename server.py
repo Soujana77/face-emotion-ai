@@ -11,44 +11,57 @@ import os
 import logging
 from datetime import datetime
 
+# ===== extra imports for PDF + chart =====
+import matplotlib
+matplotlib.use("Agg")  # headless backend
+import matplotlib.pyplot as plt
+import io
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
+
+# ================= App Init ==================
 app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ---------------- Camera & Detector ----------------
-_lock = threading.Lock()
-_cap = None
-_detector = None
-_sessions_lock = threading.Lock()
-_sessions = {}  # id -> metadata (not full data)
 RECORDINGS_DIR = os.path.join(os.path.dirname(__file__), "recordings")
 os.makedirs(RECORDINGS_DIR, exist_ok=True)
 
+# ================= Webcam + Detector ==================
+_lock = threading.Lock()
+_cap = None
+_detector = None
+
+_sessions = {}          # sid -> { meta... }
+_sessions_lock = threading.Lock()
+
+
 def _open_camera():
-    """Open webcam with a stable backend; try DSHOW then MSMF."""
+    """Try to open webcam with DSHOW first, then MSMF."""
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     if not cap or not cap.isOpened():
         cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
     return cap
 
+
 def _ensure_ready():
-    """Lazy-init camera and detector once."""
+    """Lazy-init FER detector + camera."""
     global _cap, _detector
     if _detector is None:
-        # mtcnn=False keeps deps light and is faster on CPU
         _detector = FER(mtcnn=False)
     if _cap is None or not _cap.isOpened():
         _cap = _open_camera()
 
+
 def _read_frame():
-    """Thread-safe frame read with one retry + reopen."""
+    """Thread-safe read with one reopen retry."""
     global _cap
     with _lock:
         _ensure_ready()
         ok, frame = _cap.read()
         if not ok or frame is None:
-            # try reopen once
             try:
                 if _cap is not None:
                     _cap.release()
@@ -59,35 +72,42 @@ def _read_frame():
         return ok, frame
 
 
-# ---------------- Session recorder ----------------
-def _save_report(session_id, meta, data):
-    result = {
-        "id": session_id,
+# ================= Recorder Worker ==================
+def _save_report(sid, meta, data):
+    payload = {
+        "id": sid,
         "meta": meta,
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "data": data,
     }
-    path = os.path.join(RECORDINGS_DIR, f"{session_id}.json")
+    path = os.path.join(RECORDINGS_DIR, f"{sid}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(payload, f, ensure_ascii=False, indent=2)
     return path
 
 
-def _recorder_worker(session_id, duration_s, interval_s):
+def _recorder_worker(sid, duration_s, interval_s):
     """Background worker that samples emotion and records timestamped entries."""
     start_ts = time.time()
     data = []
-    meta = {"start_ts": start_ts, "duration_requested": duration_s, "interval_s": interval_s}
-    logger.info("session %s started: duration=%s interval=%s", session_id, duration_s, interval_s)
+    meta = {
+        "start_ts": start_ts,
+        "duration_requested": duration_s,
+        "interval_s": interval_s,
+    }
+    logger.info("session %s started: duration=%s interval=%s", sid, duration_s, interval_s)
+
     try:
         while True:
             now = time.time()
             elapsed = now - start_ts
-            # check stop requested
+
+            # stop requested?
             with _sessions_lock:
-                s = _sessions.get(session_id)
+                s = _sessions.get(sid)
                 if not s or s.get("stop_requested"):
                     break
+
             if duration_s and elapsed >= duration_s:
                 break
 
@@ -99,35 +119,34 @@ def _recorder_worker(session_id, duration_s, interval_s):
                     if res:
                         label, score = res
                         conf = float(score) if isinstance(score, (int, float)) else 0.0
-                        label = label or "unknown"
+                        label = label or "none"
                     else:
-                        label, conf = None, 0.0
-                except Exception as e:
-                    label, conf = None, 0.0
-                record = {"ts": datetime.utcnow().isoformat() + "Z", "label": label, "confidence": conf}
-                data.append(record)
+                        label, conf = "none", 0.0
+                except Exception:
+                    label, conf = "none", 0.0
 
-            # sleep until next sample; keep responsive to stop flag
-            for _ in range(max(1, int(interval_s * 10))):
-                time.sleep(interval_s / max(1, int(interval_s * 10)))
-                with _sessions_lock:
-                    s = _sessions.get(session_id)
-                    if not s or s.get("stop_requested"):
-                        break
+                data.append(
+                    {
+                        "ts": datetime.utcnow().isoformat() + "Z",
+                        "label": label,
+                        "confidence": conf,
+                    }
+                )
+
+            time.sleep(interval_s)
     finally:
-        # finalize
         meta["end_ts"] = time.time()
         meta["samples"] = len(data)
-        path = _save_report(session_id, meta, data)
-        logger.info("session %s finished: samples=%s report=%s", session_id, meta["samples"], path)
+        path = _save_report(sid, meta, data)
+        logger.info("session %s finished: samples=%s file=%s", sid, meta["samples"], path)
+
         with _sessions_lock:
-            if session_id in _sessions:
-                _sessions[session_id]["status"] = "stopped"
-                _sessions[session_id]["report_path"] = path
+            if sid in _sessions:
+                _sessions[sid]["status"] = "stopped"
+                _sessions[sid]["report_path"] = path
 
 
-
-# ---------------- Routes ----------------
+# ================= Basic Routes ==================
 @app.route("/health")
 def health():
     return jsonify({"ok": True})
@@ -137,14 +156,24 @@ def health():
 @app.route("/sessions/start", methods=["POST"])
 def sessions_start():
     body = request.get_json(silent=True) or {}
-    duration = float(body.get("duration", 600))  # seconds; default 10 minutes
-    interval = float(body.get("interval", 1.0))  # sampling interval seconds
+    duration = float(body.get("duration", 600))
+    interval = float(body.get("interval", 1.0))
     sid = uuid.uuid4().hex
-    meta = {"id": sid, "created_at": datetime.utcnow().isoformat() + "Z", "status": "running", "duration": duration, "interval": interval}
+
+    meta = {
+        "id": sid,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "status": "running",
+        "duration": duration,
+        "interval": interval,
+    }
+
     with _sessions_lock:
         _sessions[sid] = {**meta, "stop_requested": False}
+
     t = threading.Thread(target=_recorder_worker, args=(sid, duration, interval), daemon=True)
     t.start()
+
     return jsonify({"ok": True, "id": sid, "meta": meta}), 201
 
 
@@ -154,38 +183,19 @@ def sessions_stop():
     sid = body.get("id")
     if not sid:
         return jsonify({"ok": False, "error": "missing id"}), 400
+
     with _sessions_lock:
         s = _sessions.get(sid)
         if not s:
             return jsonify({"ok": False, "error": "unknown id"}), 404
         s["stop_requested"] = True
+
     return jsonify({"ok": True, "id": sid}), 200
-
-
-@app.route("/sessions", methods=["GET"])
-def sessions_list():
-    with _sessions_lock:
-        items = [{k: v for k, v in s.items() if k != "stop_requested"} for s in _sessions.values()]
-    return jsonify({"ok": True, "sessions": items})
-
-
-@app.route("/sessions/<sid>/report", methods=["GET"])
-def sessions_report(sid):
-    path = os.path.join(RECORDINGS_DIR, f"{sid}.json")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return jsonify(json.load(f))
-    # if running, return partial data if available
-    with _sessions_lock:
-        s = _sessions.get(sid)
-        if s and s.get("status") == "running":
-            return jsonify({"ok": True, "meta": s})
-    return jsonify({"ok": False, "error": "not found"}), 404
 
 
 @app.route("/sessions/<sid>/summary", methods=["GET"])
 def sessions_summary(sid):
-    """Return a summarized report for a session: counts, percentages, top emotion, and per-minute buckets."""
+    """Return counts, percentages, top emotion + per-minute timeline."""
     path = os.path.join(RECORDINGS_DIR, f"{sid}.json")
     if not os.path.exists(path):
         return jsonify({"ok": False, "error": "not found"}), 404
@@ -196,38 +206,36 @@ def sessions_summary(sid):
     data = report.get("data", [])
     total = len(data)
     counts = {}
-    # collect timestamps as epoch seconds for bucketing
     times = []
+
     for r in data:
         label = r.get("label") or "none"
         counts[label] = counts.get(label, 0) + 1
+        ts_str = r.get("ts")
         try:
-            ts = datetime.fromisoformat(r.get("ts".replace("Z", "")))
-        except Exception:
-            ts = None
-        if ts:
+            ts = datetime.fromisoformat(ts_str.replace("Z", ""))
             times.append(ts.timestamp())
+        except Exception:
+            pass
 
     percentages = {k: (v / total * 100.0) if total else 0.0 for k, v in counts.items()}
-    top = None
-    if counts:
-        top = max(counts.items(), key=lambda x: x[1])[0]
+    top = max(counts.items(), key=lambda x: x[1])[0] if counts else "none"
 
-    # per-minute buckets relative to start
+    # per-minute timeline
     timeline = []
-    if times:
+    if data and times:
         start = min(times)
         buckets = {}
         for r in data:
             try:
-                ts = datetime.fromisoformat(r.get("ts").replace("Z", ""))
+                ts = datetime.fromisoformat(r["ts"].replace("Z", ""))
                 minute = int((ts.timestamp() - start) // 60)
             except Exception:
                 minute = 0
             label = r.get("label") or "none"
             buckets.setdefault(minute, {})
             buckets[minute][label] = buckets[minute].get(label, 0) + 1
-        # convert to list sorted by minute
+
         for minute in sorted(buckets.keys()):
             timeline.append({"minute": minute, "counts": buckets[minute]})
 
@@ -250,6 +258,74 @@ def sessions_download(sid):
         return send_file(path, as_attachment=True)
     return jsonify({"ok": False, "error": "not found"}), 404
 
+
+# ============== PDF EXPORT (WITH GRAPH) ==============
+@app.route("/sessions/<sid>/pdf", methods=["GET"])
+def generate_pdf(sid):
+    path = os.path.join(RECORDINGS_DIR, f"{sid}.json")
+    if not os.path.exists(path):
+        return jsonify({"ok": False, "error": "report not found"}), 404
+
+    with open(path, "r", encoding="utf-8") as f:
+        report = json.load(f)
+
+    data = report.get("data", [])
+    total = len(data)
+
+    counts = {}
+    for item in data:
+        emo = item.get("label", "none")
+        counts[emo] = counts.get(emo, 0) + 1
+
+    if total > 0:
+        percentages = {k: (v / total * 100.0) for k, v in counts.items()}
+    else:
+        percentages = {}
+    top = max(counts, key=counts.get) if counts else "none"
+
+    # ---- bar chart image ----
+    if percentages:
+        plt.figure(figsize=(4, 3))
+        plt.bar(list(percentages.keys()), list(percentages.values()), color="cyan")
+        plt.ylabel("%")
+        plt.title("Emotion Percentage Distribution")
+        img_buffer = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(img_buffer, format="png")
+        plt.close()
+        img_buffer.seek(0)
+        img_reader = ImageReader(img_buffer)
+    else:
+        img_reader = None
+
+    # ---- build PDF ----
+    pdf_path = os.path.join(RECORDINGS_DIR, f"{sid}.pdf")
+    c = canvas.Canvas(pdf_path, pagesize=A4)
+    w, h = A4
+
+    c.setFont("Helvetica-Bold", 18)
+    c.drawString(70, h - 60, "Emotion Detection Report")
+
+    c.setFont("Helvetica", 12)
+    c.drawString(70, h - 100, f"Session ID: {sid}")
+    c.drawString(70, h - 120, f"Total Samples: {total}")
+    c.drawString(70, h - 140, f"Top Emotion: {top}")
+
+    y = h - 180
+    for emo, p in percentages.items():
+        c.drawString(70, y, f"{emo}: {p:.1f}%")
+        y -= 18
+
+    if img_reader:
+        c.drawImage(img_reader, 70, y - 240, width=380, height=240, preserveAspectRatio=True, mask="auto")
+
+    c.showPage()
+    c.save()
+
+    return send_file(pdf_path, as_attachment=True)
+
+
+# ================= Live Emotion + Video ==================
 @app.route("/emotion")
 def emotion():
     try:
@@ -257,47 +333,42 @@ def emotion():
         if not ok or frame is None:
             return jsonify({"ok": True, "emotion": "camera_error", "confidence": 0.0})
 
-        # FER expects RGB
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # returns (label, score) or None
         result = _detector.top_emotion(rgb)
         if not result:
             return jsonify({"ok": True, "emotion": "no_face", "confidence": 0.0})
 
         label, score = result
-        # Guard: score can be None sometimes
         conf = float(score) if isinstance(score, (int, float)) else 0.0
-        label = label or "unknown"
+        label = label or "none"
 
         return jsonify({"ok": True, "emotion": label, "confidence": conf})
-
     except Exception as e:
-        # Never crash the server; return a safe payload
         return jsonify({"ok": False, "error": str(e), "emotion": "server_error", "confidence": 0.0}), 200
 
-# -------- MJPEG video stream so React can show the camera --------
+
 def _generate_frames():
     while True:
         ok, frame = _read_frame()
         if not ok or frame is None:
             continue
-        ret, buffer = cv2.imencode(".jpg", frame)
+        ret, buf = cv2.imencode(".jpg", frame)
         if not ret:
             continue
-        jpg = buffer.tobytes()
-        yield (b"--frame\r\n"
-               b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+        jpg = buf.tobytes()
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+        )
+
 
 @app.route("/video_feed")
 def video_feed():
-    # Stream as multipart/x-mixed-replace (Motion JPEG)
-    return Response(_generate_frames(),
-                    mimetype="multipart/x-mixed-replace; boundary=frame")
+    return Response(_generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 @app.route("/release")
 def release():
-    """Optional: manually release camera if it gets stuck."""
     global _cap
     with _lock:
         try:
@@ -307,7 +378,8 @@ def release():
             _cap = None
     return jsonify({"ok": True, "released": True})
 
-# Ensure camera is released on exit
+
+# ================= Cleanup & Main ==================
 def _cleanup():
     global _cap
     try:
@@ -315,10 +387,9 @@ def _cleanup():
             _cap.release()
     except Exception:
         pass
+
+
 atexit.register(_cleanup)
 
-# ---------------- Main ----------------
 if __name__ == "__main__":
-    # debug=True enables hot-reload; if it bothers the camera on your machine,
-    # you can set debug=False.
     app.run(debug=True)
